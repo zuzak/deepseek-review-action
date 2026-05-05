@@ -21,11 +21,13 @@ Create `.github/workflows/deepseek-review.yml` in your repo:
       review:
         runs-on: ubuntu-latest
         steps:
-          - uses: zuzak/deepseek-review-action@v1
+          - uses: zuzak/deepseek-review-action@main
             with:
               deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
 
-Add your own prompt by creating `.github/deepseek/prompt.md`. If no file exists, the bundled generic template is used.
+Using `@main` is recommended so that improvements to the base prompt template propagate automatically to all consumers. Pin to a tag only if you need reproducible behaviour across pushes to this action.
+
+To add repo-specific review guidance, create one or more files matching the `repo-context-glob` pattern (default: `.github/deepseek/*.md`). Their content is injected into the bundled base template at the `{{REPO_CONTEXT}}` slot.
 
 Inputs
 ------
@@ -35,7 +37,7 @@ Inputs
 | `deepseek-api-key` | yes | — | DeepSeek API key |
 | `github-token` | no | `github.token` | Token for posting reviews. Swap to a GitHub App token to enable proper re-request flow (#688). |
 | `reviewer-login` | no | `github-actions[bot]` | GitHub login that posts reviews; used to dismiss stale CHANGES_REQUESTED. Update to your App bot login when using an App token. |
-| `prompt-template-glob` | no | `.github/deepseek/*.md` | Glob for prompt files, concatenated in sort order |
+| `repo-context-glob` | no | `.github/deepseek/*.md` | Glob for repo-specific context files (appended at `{{REPO_CONTEXT}}` in the base template). Leave empty if no repo-specific context. |
 | `exclude-paths` | no | _(empty)_ | Newline-separated gitignore-style paths excluded from the HEAD snapshot |
 | `skip-if-paths-changed` | no | _(empty)_ | Skip review if PR touches any of these paths |
 | `recheck-comment-prefix` | no | `/ds-recheck` | Comment prefix (any author) that triggers a recheck |
@@ -46,12 +48,15 @@ Inputs
 Prompt template
 ---------------
 
-The prompt template is assembled by concatenating all files matching `prompt-template-glob` in sort order. Use multiple files to compose sections (e.g. `00-instructions.md`, `10-repo-context.md`).
+The bundled `prompt-template.md` in this action repo is the canonical base template and always loads. Consumers do not replace it — they extend it.
+
+To add repo-specific guidance (project conventions, filing instructions, areas to focus on), create files matching `repo-context-glob`. Their contents are concatenated in sort order and injected at the `{{REPO_CONTEXT}}` placeholder in the base template. If no files match, `{{REPO_CONTEXT}}` is replaced with an empty string.
 
 Placeholders substituted at runtime:
 
 | Placeholder | Content |
 |---|---|
+| `{{REPO_CONTEXT}}` | Concatenated repo-specific context files (empty if none match) |
 | `{{TRIGGER}}` | `first-or-push` or `recheck` |
 | `{{PR_LABELS}}` | Comma-separated PR labels |
 | `{{PRIOR_REVIEW_THREAD}}` | All PR comments in chronological order |
@@ -79,6 +84,14 @@ Migrating from an inline workflow
 If you have an existing inline workflow (e.g. the one previously in `zuzak/claude`):
 
 1. Replace the workflow body with the `uses:` step above.
-2. Move your prompt from `deepseek/prompt.md` to `.github/deepseek/prompt.md`.
+2. Move any repo-specific prompt content to `.github/deepseek/context.md` (or any `.md` file under `.github/deepseek/`).
 3. Add `exclude-paths` and `skip-if-paths-changed` as needed.
 4. Remove any zuzak/claude-specific label inputs unless your repo uses the same labels.
+
+Migrating from `prompt-template-glob`
+--------------------------------------
+
+The `prompt-template-glob` input (which replaced the bundled template) has been renamed `repo-context-glob` and now provides context injected *into* the bundled template rather than replacing it. To migrate:
+
+1. Rename `prompt-template-glob:` to `repo-context-glob:` in your workflow.
+2. Strip the review instructions from your context files — those are now in the bundled template. Keep only repo-specific guidance (project conventions, filing instructions, areas of focus).
