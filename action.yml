@@ -1,0 +1,453 @@
+name: DeepSeek PR Review
+description: Posts an AI code review on pull requests using DeepSeek. Supports /ds-recheck comment-triggered reruns.
+
+inputs:
+  deepseek-api-key:
+    description: DeepSeek API key
+    required: true
+  github-token:
+    description: GitHub token for posting reviews and fetching PR context
+    required: false
+    default: ${{ github.token }}
+  reviewer-login:
+    description: GitHub login that posts reviews (used to dismiss stale CHANGES_REQUESTED). Set to your App bot login when using an App token.
+    required: false
+    default: github-actions[bot]
+  prompt-template-glob:
+    description: Glob for prompt template files, concatenated in sort order. Falls back to the bundled generic template if no files match.
+    required: false
+    default: .github/deepseek/*.md
+  exclude-paths:
+    description: Newline-separated gitignore-style path patterns excluded from the HEAD context snapshot
+    required: false
+    default: ''
+  skip-if-paths-changed:
+    description: Skip DS review if the PR touches any of these paths (newline-separated gitignore-style patterns)
+    required: false
+    default: ''
+  recheck-comment-prefix:
+    description: Any PR comment starting with this prefix (from any user) triggers a DS recheck
+    required: false
+    default: /ds-recheck
+  max-rechecks:
+    description: Maximum /ds-recheck comments per DS round before declaring deadlock
+    required: false
+    default: '2'
+  label-deadlock:
+    description: Label to apply on recheck cap or author IMPASSE. Leave empty to disable.
+    required: false
+    default: ''
+  model:
+    description: DeepSeek model
+    required: false
+    default: deepseek-reasoner
+
+runs:
+  using: composite
+  steps:
+    - name: Gate — should we run?
+      id: gate
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        COMMENT_BODY: ${{ github.event_name == 'issue_comment' && github.event.comment.body || '' }}
+        RECHECK_PREFIX: ${{ inputs.recheck-comment-prefix }}
+      run: |
+        # Determine whether this event is one we should act on.
+        run=true
+        is_recheck=false
+
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          PR_NUM="${{ github.event.pull_request.number }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          BASE_REF="${{ github.base_ref }}"
+
+        elif [ "${{ github.event_name }}" = "issue_comment" ]; then
+          # Only proceed if this is a PR comment with the recheck prefix.
+          if [ -z "${{ github.event.issue.pull_request }}" ]; then
+            echo "Not a PR comment — skipping." ; run=false
+          elif [[ "$COMMENT_BODY" != "${RECHECK_PREFIX}"* ]]; then
+            echo "Comment does not start with '${RECHECK_PREFIX}' — skipping." ; run=false
+          else
+            is_recheck=true
+            PR_NUM="${{ github.event.issue.number }}"
+            HEAD_SHA=$(gh pr view "$PR_NUM" --repo "${{ github.repository }}" --json headRefOid --jq .headRefOid)
+            BASE_REF=$(gh pr view "$PR_NUM" --repo "${{ github.repository }}" --json baseRefName --jq .baseRefName)
+          fi
+
+        else
+          echo "Unsupported event: ${{ github.event_name }} — skipping." ; run=false
+        fi
+
+        echo "pr_number=$PR_NUM"   >> "$GITHUB_OUTPUT"
+        echo "head_sha=$HEAD_SHA"  >> "$GITHUB_OUTPUT"
+        echo "base_ref=$BASE_REF"  >> "$GITHUB_OUTPUT"
+        echo "is_recheck=$is_recheck" >> "$GITHUB_OUTPUT"
+        echo "run=$run"            >> "$GITHUB_OUTPUT"
+
+    - uses: actions/checkout@v5
+      if: steps.gate.outputs.run == 'true'
+      with:
+        fetch-depth: 0
+        ref: ${{ steps.gate.outputs.head_sha }}
+
+    - name: Skip-paths check
+      id: skip_paths
+      if: steps.gate.outputs.run == 'true' && inputs.skip-if-paths-changed != ''
+      shell: python3 {0}
+      run: |
+        import subprocess, fnmatch, os, sys
+        patterns = """${{ inputs.skip-if-paths-changed }}""".strip().splitlines()
+        result = subprocess.run(
+            ['git', 'diff', '--name-only',
+             'origin/${{ steps.gate.outputs.base_ref }}...HEAD'],
+            capture_output=True, text=True
+        )
+        changed = result.stdout.strip().splitlines()
+        for f in changed:
+            for pat in patterns:
+                pat = pat.strip()
+                if pat and fnmatch.fnmatch(f, pat):
+                    print(f"Skipping: {f} matches skip pattern '{pat}'")
+                    with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+                        out.write('skip=true\n')
+                    sys.exit(0)
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+            out.write('skip=false\n')
+
+    - name: Generate patch
+      id: patch
+      if: steps.gate.outputs.run == 'true' && steps.skip_paths.outputs.skip != 'true'
+      shell: bash
+      run: |
+        git diff -U99999 "origin/${{ steps.gate.outputs.base_ref }}...HEAD" > /tmp/ds-review.patch
+
+        SIZE=$(wc -c < /tmp/ds-review.patch)
+        if [ ! -s /tmp/ds-review.patch ]; then
+          echo "Empty patch — skipping." ; echo "ok=false" >> "$GITHUB_OUTPUT"
+        elif [ "$SIZE" -gt 200000 ]; then
+          echo "Patch too large (${SIZE} bytes) — skipping." ; echo "ok=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Recheck cap check
+      id: cap
+      if: >-
+        steps.gate.outputs.run == 'true' &&
+        steps.gate.outputs.is_recheck == 'true' &&
+        steps.patch.outputs.ok == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        COMMENT_BODY: ${{ github.event_name == 'issue_comment' && github.event.comment.body || '' }}
+        MAX_RECHECKS: ${{ inputs.max-rechecks }}
+        RECHECK_PREFIX: ${{ inputs.recheck-comment-prefix }}
+      run: |
+        # Find the timestamp of the most recent DS review, or PR creation if none.
+        SINCE=$(gh api \
+          "repos/${{ github.repository }}/pulls/${{ steps.gate.outputs.pr_number }}/reviews?per_page=100" \
+          --paginate \
+          --jq '.[] | select(.user.login == "github-actions[bot]") | .submitted_at' \
+          | tail -n1)
+        if [ -z "$SINCE" ]; then
+          SINCE=$(gh api "repos/${{ github.repository }}/pulls/${{ steps.gate.outputs.pr_number }}" \
+            --jq '.created_at')
+        fi
+
+        PRIOR=$(SINCE="$SINCE" gh api \
+          "repos/${{ github.repository }}/issues/${{ steps.gate.outputs.pr_number }}/comments?per_page=100" \
+          --paginate \
+          --jq "env.SINCE as \$since | .[] | select(.body | startswith(\"$RECHECK_PREFIX\")) | select(.created_at > \$since) | .id" \
+          | wc -l)
+
+        LAST_LINE=$(printf '%s' "$COMMENT_BODY" | awk 'NF{line=$0} END{print line}')
+
+        echo "prior=$PRIOR" >> "$GITHUB_OUTPUT"
+        if [ "$PRIOR" -gt "$MAX_RECHECKS" ]; then
+          echo "capped=true"   >> "$GITHUB_OUTPUT"
+        else
+          echo "capped=false"  >> "$GITHUB_OUTPUT"
+        fi
+        if [ "$LAST_LINE" = "<!-- IMPASSE -->" ]; then
+          echo "impasse=true"  >> "$GITHUB_OUTPUT"
+        else
+          echo "impasse=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Post cap notice and apply deadlock label
+      if: >-
+        steps.cap.outputs.capped == 'true' ||
+        steps.cap.outputs.impasse == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        LABEL: ${{ inputs.label-deadlock }}
+      run: |
+        if [ -n "$LABEL" ]; then
+          gh label create "$LABEL" \
+            --repo "${{ github.repository }}" \
+            --color "B60205" \
+            --description "DS/author impasse or recheck cap reached" \
+            2>/dev/null || true
+          gh pr edit "${{ steps.gate.outputs.pr_number }}" \
+            --repo "${{ github.repository }}" \
+            --add-label "$LABEL" || true
+        fi
+
+        if [ "${{ steps.cap.outputs.capped }}" = "true" ]; then
+          cat > /tmp/ds-cap-notice.md <<'MSG'
+          DS recheck cap reached
+          ======================
+
+          The maximum number of recheck rounds has been reached for this DS review.
+          Further rebuttals will not trigger DS again. Adjudicate via human review.
+
+          _Posted by the DeepSeek review action, not by the model._
+          MSG
+          gh pr comment "${{ steps.gate.outputs.pr_number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/ds-cap-notice.md
+        fi
+
+    - name: Gather prior review thread
+      if: >-
+        steps.gate.outputs.run == 'true' &&
+        steps.patch.outputs.ok == 'true' &&
+        steps.cap.outputs.capped != 'true' &&
+        steps.cap.outputs.impasse != 'true' &&
+        steps.skip_paths.outputs.skip != 'true'
+      id: thread
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        gh api "repos/${{ github.repository }}/issues/${{ steps.gate.outputs.pr_number }}/comments?per_page=100" \
+          --paginate \
+          --jq '.[] | {who: .user.login, at: .created_at, body: .body}' \
+          | jq -s '.' > /tmp/ds-thread.json
+
+        if [ "$(jq 'length' /tmp/ds-thread.json)" -gt 0 ]; then
+          jq -r '.[] | "### \(.who) — \(.at)\n\n\(.body)\n"' /tmp/ds-thread.json > /tmp/ds-thread.md
+        else
+          printf '_(empty — this is the first review round.)_\n' > /tmp/ds-thread.md
+        fi
+
+        gh pr view "${{ steps.gate.outputs.pr_number }}" \
+          --repo "${{ github.repository }}" \
+          --json labels \
+          --jq '[.labels[].name] | if length == 0 then "(none)" else join(", ") end' \
+          > /tmp/ds-labels.txt
+
+        if [ "${{ steps.gate.outputs.is_recheck }}" = "true" ]; then
+          printf 'recheck' > /tmp/ds-trigger.txt
+        else
+          printf 'first-or-push' > /tmp/ds-trigger.txt
+        fi
+
+    - name: Snapshot HEAD context
+      if: >-
+        steps.gate.outputs.run == 'true' &&
+        steps.patch.outputs.ok == 'true' &&
+        steps.cap.outputs.capped != 'true' &&
+        steps.cap.outputs.impasse != 'true' &&
+        steps.skip_paths.outputs.skip != 'true'
+      shell: python3 {0}
+      run: |
+        import subprocess, fnmatch, pathlib, sys
+
+        exclude_raw = """${{ inputs.exclude-paths }}"""
+        excludes = [p.strip() for p in exclude_raw.strip().splitlines() if p.strip()]
+
+        files = subprocess.check_output(['git', 'ls-files']).decode().strip().splitlines()
+
+        chunks = []
+        total = 0
+        MAX = 400_000  # ~400KB hard cap
+
+        for f in sorted(files):
+            if any(fnmatch.fnmatch(f, pat) for pat in excludes):
+                continue
+            try:
+                content = pathlib.Path(f).read_text(errors='replace')
+            except Exception:
+                continue
+            chunk = f'=== {f} ===\n{content}\n'
+            if total + len(chunk) > MAX:
+                chunks.append(f'\n_(remaining files truncated at {MAX} bytes)_\n')
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+
+        pathlib.Path('/tmp/ds-repo.txt').write_text(''.join(chunks))
+        print(f'Snapshotted {len(chunks)} files ({total} bytes)', file=sys.stderr)
+
+    - name: Build prompt
+      if: >-
+        steps.gate.outputs.run == 'true' &&
+        steps.patch.outputs.ok == 'true' &&
+        steps.cap.outputs.capped != 'true' &&
+        steps.cap.outputs.impasse != 'true' &&
+        steps.skip_paths.outputs.skip != 'true'
+      shell: python3 {0}
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        import glob, os, pathlib, sys
+
+        pattern = """${{ inputs.prompt-template-glob }}"""
+        files = sorted(glob.glob(pattern))
+        if not files:
+            fallback = pathlib.Path(os.environ['ACTION_PATH']) / 'prompt-template.md'
+            if fallback.exists():
+                files = [str(fallback)]
+            else:
+                sys.exit('No prompt template files found and no bundled fallback available.')
+
+        template = '\n'.join(pathlib.Path(f).read_text() for f in files)
+
+        subs = {
+            '{{TRIGGER}}':             pathlib.Path('/tmp/ds-trigger.txt').read_text().strip(),
+            '{{PR_LABELS}}':           pathlib.Path('/tmp/ds-labels.txt').read_text().strip(),
+            '{{PRIOR_REVIEW_THREAD}}': pathlib.Path('/tmp/ds-thread.md').read_text(),
+            '{{PATCH}}':               pathlib.Path('/tmp/ds-review.patch').read_text(),
+            '{{REPO_CONTENTS}}':       pathlib.Path('/tmp/ds-repo.txt').read_text(),
+        }
+
+        out = template
+        for k, v in subs.items():
+            out = out.replace(k, v)
+
+        # Warn about any unresolved placeholders that look ours.
+        import re
+        for m in re.findall(r'\{\{[A-Z_]+\}\}', out):
+            print(f'Warning: unresolved placeholder {m}', file=sys.stderr)
+
+        pathlib.Path('/tmp/ds-prompt.md').write_text(out)
+
+    - name: Call DeepSeek
+      if: >-
+        steps.gate.outputs.run == 'true' &&
+        steps.patch.outputs.ok == 'true' &&
+        steps.cap.outputs.capped != 'true' &&
+        steps.cap.outputs.impasse != 'true' &&
+        steps.skip_paths.outputs.skip != 'true'
+      id: call
+      shell: bash
+      env:
+        DEEPSEEK_API_KEY: ${{ inputs.deepseek-api-key }}
+        MODEL: ${{ inputs.model }}
+      run: |
+        jq -n --rawfile content /tmp/ds-prompt.md \
+          --arg model "$MODEL" \
+          '{model: $model, messages: [{role: "user", content: $content}]}' \
+          > /tmp/ds-request.json
+
+        curl -sS https://api.deepseek.com/chat/completions \
+          -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+          -H "Content-Type: application/json" \
+          --max-time 120 \
+          --connect-timeout 10 \
+          -d @/tmp/ds-request.json \
+          > /tmp/ds-response.json
+
+    - name: Parse response
+      if: steps.call.outcome == 'success'
+      id: parse
+      shell: bash
+      run: |
+        if ! jq -e '.choices[0].message.content' /tmp/ds-response.json > /dev/null 2>&1; then
+          { echo "DeepSeek API error:"; jq -r '.error.message // "unknown error"' /tmp/ds-response.json; } \
+            > /tmp/ds-review.md
+          echo "verdict=--comment" >> "$GITHUB_OUTPUT"
+          echo "impasse=false" >> "$GITHUB_OUTPUT"
+        else
+          jq -r '.choices[0].message.content' /tmp/ds-response.json > /tmp/ds-review.md
+          LAST=$(tail -n1 /tmp/ds-review.md)
+          if [ "$LAST" = "<!-- IMPASSE -->" ]; then
+            echo "verdict=--comment"          >> "$GITHUB_OUTPUT"
+            echo "impasse=true"               >> "$GITHUB_OUTPUT"
+          elif [ "$LAST" = "<!-- REQUEST CHANGES -->" ]; then
+            echo "verdict=--request-changes"  >> "$GITHUB_OUTPUT"
+            echo "impasse=false"              >> "$GITHUB_OUTPUT"
+          elif [ "$LAST" = "<!-- APPROVE -->" ]; then
+            echo "verdict=--approve"          >> "$GITHUB_OUTPUT"
+            echo "impasse=false"              >> "$GITHUB_OUTPUT"
+          else
+            echo "verdict=--comment"          >> "$GITHUB_OUTPUT"
+            echo "impasse=false"              >> "$GITHUB_OUTPUT"
+          fi
+        fi
+
+        if jq -e '.model' /tmp/ds-response.json > /dev/null 2>&1; then
+          MODEL=$(jq -r '.model' /tmp/ds-response.json)
+          printf '\n_Reviewed by %s against https://github.com/%s/compare/%s...%s with prior review thread as continuity_\n' \
+            "$MODEL" \
+            "${{ github.repository }}" \
+            "${{ steps.gate.outputs.base_ref }}" \
+            "${{ steps.gate.outputs.head_sha }}" \
+            >> /tmp/ds-review.md
+        fi
+
+    - name: Dismiss prior CHANGES_REQUESTED on clean verdict
+      if: >-
+        steps.parse.outcome == 'success' &&
+        steps.parse.outputs.verdict != '--request-changes' &&
+        steps.parse.outputs.impasse != 'true'
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REVIEWER_LOGIN: ${{ inputs.reviewer-login }}
+      run: |
+        REVIEW_IDS=$(gh api \
+          "repos/${{ github.repository }}/pulls/${{ steps.gate.outputs.pr_number }}/reviews?per_page=100" \
+          --jq "[.[] | select(.user.login == \"$REVIEWER_LOGIN\" and .state == \"CHANGES_REQUESTED\")] | .[].id")
+
+        for REVIEW_ID in $REVIEW_IDS; do
+          gh api -X PUT \
+            "repos/${{ github.repository }}/pulls/${{ steps.gate.outputs.pr_number }}/reviews/$REVIEW_ID/dismissals" \
+            -f message="DS posted a clean verdict — dismissing prior CHANGES_REQUESTED" \
+            || echo "Failed to dismiss $REVIEW_ID (continuing)"
+        done
+
+    - name: Post review
+      if: steps.parse.outcome == 'success'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        if [ "${{ steps.parse.outputs.impasse }}" = "true" ]; then
+          gh pr comment "${{ steps.gate.outputs.pr_number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/ds-review.md
+        else
+          gh pr review "${{ steps.gate.outputs.pr_number }}" \
+            --repo "${{ github.repository }}" \
+            ${{ steps.parse.outputs.verdict }} \
+            --body-file /tmp/ds-review.md
+        fi
+
+    - name: Apply deadlock label on DS IMPASSE
+      if: steps.parse.outputs.impasse == 'true' && inputs.label-deadlock != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        LABEL: ${{ inputs.label-deadlock }}
+      run: |
+        gh label create "$LABEL" \
+          --repo "${{ github.repository }}" \
+          --color "B60205" \
+          --description "DS/author impasse or recheck cap reached" \
+          2>/dev/null || true
+        gh pr edit "${{ steps.gate.outputs.pr_number }}" \
+          --repo "${{ github.repository }}" \
+          --add-label "$LABEL" || true
+
+    - name: Upload reasoning trace
+      if: always() && steps.call.outcome == 'success'
+      uses: actions/upload-artifact@v5
+      with:
+        name: deepseek-response-${{ steps.gate.outputs.pr_number }}-${{ github.run_attempt }}-${{ github.run_id }}
+        path: /tmp/ds-response.json
+        retention-days: 30
