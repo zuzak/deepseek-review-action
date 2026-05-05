@@ -13,8 +13,8 @@ inputs:
     description: GitHub login that posts reviews (used to dismiss stale CHANGES_REQUESTED). Set to your App bot login when using an App token.
     required: false
     default: github-actions[bot]
-  prompt-template-glob:
-    description: Glob for prompt template files, concatenated in sort order. Falls back to the bundled generic template if no files match.
+  repo-context-glob:
+    description: Glob for repo-specific context files (appended at {{REPO_CONTEXT}} in the base template). Leave empty if no repo-specific context.
     required: false
     default: .github/deepseek/*.md
   exclude-paths:
@@ -295,17 +295,19 @@ runs:
       run: |
         import glob, os, pathlib, sys
 
-        pattern = """${{ inputs.prompt-template-glob }}"""
-        files = sorted(glob.glob(pattern))
-        if not files:
-            fallback = pathlib.Path(os.environ['ACTION_PATH']) / 'prompt-template.md'
-            if fallback.exists():
-                files = [str(fallback)]
-            else:
-                sys.exit('No prompt template files found and no bundled fallback available.')
+        # Always load the canonical base template from the action repo.
+        base_path = pathlib.Path(os.environ['ACTION_PATH']) / 'prompt-template.md'
+        if not base_path.exists():
+            sys.exit('Bundled prompt-template.md not found in action repo.')
+        template = base_path.read_text()
 
-        template = '\n'.join(pathlib.Path(f).read_text() for f in files)
+        # Load repo-specific context files (if any) and inject at {{REPO_CONTEXT}}.
+        pattern = """${{ inputs.repo-context-glob }}"""
+        context_files = sorted(glob.glob(pattern)) if pattern.strip() else []
+        repo_context = '\n'.join(pathlib.Path(f).read_text() for f in context_files)
+        template = template.replace('{{REPO_CONTEXT}}', repo_context)
 
+        # Substitute remaining dynamic placeholders.
         subs = {
             '{{TRIGGER}}':             pathlib.Path('/tmp/ds-trigger.txt').read_text().strip(),
             '{{PR_LABELS}}':           pathlib.Path('/tmp/ds-labels.txt').read_text().strip(),

@@ -30,6 +30,10 @@ If you add criteria, mention it. Proactively flag where the prompt or process co
 If a suggestion cannot be addressed in this PR, recommend it be filed as a GitHub issue —
 you cannot reply to inline comments, so unactioned observations otherwise stay buried.
 
+## Repository context
+
+{{REPO_CONTEXT}}
+
 ## Trigger context
 
 This run was triggered by: `{{TRIGGER}}`
