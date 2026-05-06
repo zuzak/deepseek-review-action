@@ -415,6 +415,8 @@ runs:
 
     - name: Post review
       if: steps.parse.outcome == 'success'
+      id: post_review
+      continue-on-error: true
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
@@ -429,6 +431,22 @@ runs:
             ${{ steps.parse.outputs.verdict }} \
             --body-file /tmp/ds-review.md
         fi
+
+    - name: Fallback — post review as comment if review post failed
+      if: steps.post_review.outcome == 'failure'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        {
+          printf '> [!WARNING]\n'
+          printf '> DS review could not be posted as a formal review (e.g. token lacks `pull_requests: write`). '
+          printf 'Posting as a comment instead so the verdict is not lost.\n\n'
+          cat /tmp/ds-review.md
+        } > /tmp/ds-fallback.md
+        gh pr comment "${{ steps.gate.outputs.pr_number }}" \
+          --repo "${{ github.repository }}" \
+          --body-file /tmp/ds-fallback.md
 
     - name: Apply deadlock label on DS IMPASSE
       if: steps.parse.outputs.impasse == 'true' && inputs.label-deadlock != ''
