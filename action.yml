@@ -414,7 +414,9 @@ runs:
         done
 
     - name: Post review
+      id: post_review
       if: steps.parse.outcome == 'success'
+      continue-on-error: true
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
@@ -429,6 +431,16 @@ runs:
             ${{ steps.parse.outputs.verdict }} \
             --body-file /tmp/ds-review.md
         fi
+
+    - name: Post fallback comment on review failure
+      if: steps.post_review.outcome == 'failure'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        gh pr comment "${{ steps.gate.outputs.pr_number }}" \
+          --repo "${{ github.repository }}" \
+          --body "DS review generated but failed to post. See run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
     - name: Apply deadlock label on DS IMPASSE
       if: steps.parse.outputs.impasse == 'true' && inputs.label-deadlock != ''
