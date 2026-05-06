@@ -440,7 +440,7 @@ runs:
       run: |
         {
           printf '> [!WARNING]\n'
-          printf '> DS review could not be posted as a formal review (e.g. token lacks `pull_requests: write`). '
+          printf '> DS review could not be posted as a formal review (common cause: token lacks `pull_requests: write`). '
           printf 'Posting as a comment instead so the verdict is not lost.\n\n'
           cat /tmp/ds-review.md
         } > /tmp/ds-fallback.md
