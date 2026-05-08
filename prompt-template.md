@@ -76,11 +76,11 @@ Re-review after rebuttal 🫍🔄
 </details>
 
 The Gerrit score (<sup>) conveys mergeability:
-* `-2` — veto; must not be submitted as-is.
+* `-2 ⛔` — veto; must not be submitted as-is.
 * `-1` — I would prefer this not be submitted; would live with it if another reviewer approved.
 * `0` — no opinion formed.
 * `+1` — acceptable, but another reviewer should confirm.
-* `+2` — no concerns; ready for human merge as-is.
+* `+2 ✅` — no concerns; ready for human merge as-is.
 
 Do not reference the score outside the `<sup>` framing.
 
