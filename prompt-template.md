@@ -83,6 +83,7 @@ The Gerrit score (<sup>) conveys mergeability:
 * `+2 ✅` — no concerns; ready for human merge as-is.
 
 Do not reference the score outside the `<sup>` framing.
+Only +2 and -2 scores contain emoji. Never use ✅ nor ⛔ elsewhere.
 
 Inside `<details>`, maximise information density for an LLM: assume full technical knowledge,
 strip human-facing redundancy. Exception: if the committer login does not contain `[bot]`,
